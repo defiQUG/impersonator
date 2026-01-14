@@ -45,6 +45,8 @@ export interface SafeInfo {
   safeAddress: string;
   network: LowercaseNetworks;
   ethBalance: string;
+  owners?: string[];
+  threshold?: number;
 }
 export interface InterfaceMessageToPayload {
   [INTERFACE_MESSAGES.ON_SAFE_INFO]: SafeInfo;
@@ -534,4 +536,118 @@ export interface Transaction {
   to: string;
   value: string;
   data: string;
+}
+
+// ======= Smart Wallet Types ======
+
+export enum SmartWalletType {
+  GNOSIS_SAFE = "GNOSIS_SAFE",
+  ERC4337 = "ERC4337",
+  CUSTOM = "CUSTOM",
+}
+
+export interface SmartWalletConfig {
+  id: string;
+  type: SmartWalletType;
+  address: string;
+  networkId: number;
+  owners: string[];
+  threshold: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface OwnerInfo {
+  address: string;
+  label?: string;
+  ensName?: string;
+}
+
+export enum TransactionExecutionMethod {
+  DIRECT_ONCHAIN = "DIRECT_ONCHAIN",
+  RELAYER = "RELAYER",
+  SIMULATION = "SIMULATION",
+}
+
+export interface TransactionRequest {
+  id: string;
+  from: string;
+  to: string;
+  value: string;
+  data: string;
+  gasLimit?: string;
+  gasPrice?: string;
+  maxFeePerGas?: string;
+  maxPriorityFeePerGas?: string;
+  nonce?: number;
+  method: TransactionExecutionMethod;
+  status: TransactionRequestStatus;
+  hash?: string;
+  createdAt: number;
+  executedAt?: number;
+  expiresAt?: number;
+  error?: string;
+}
+
+// TransactionStatus enum already defined above (line 171)
+// Removed duplicate definition
+export enum TransactionRequestStatus {
+  PENDING = "PENDING",
+  APPROVED = "APPROVED",
+  REJECTED = "REJECTED",
+  EXECUTING = "EXECUTING",
+  SUCCESS = "SUCCESS",
+  FAILED = "FAILED",
+}
+
+export interface TokenBalance {
+  tokenAddress: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  balance: string;
+  balanceFormatted: string;
+  usdValue?: string;
+  logoUri?: string;
+}
+
+export interface WalletBalance {
+  native: string;
+  nativeFormatted: string;
+  tokens: TokenBalance[];
+  totalUsdValue?: string;
+}
+
+export interface MultiSigApproval {
+  transactionId: string;
+  approver: string;
+  approved: boolean;
+  timestamp: number;
+  signature?: string;
+}
+
+export interface PendingTransaction {
+  id: string;
+  transaction: TransactionRequest;
+  approvals: MultiSigApproval[];
+  approvalCount: number;
+  requiredApprovals: number;
+  canExecute: boolean;
+}
+
+export interface RelayerConfig {
+  id: string;
+  name: string;
+  apiUrl: string;
+  apiKey?: string;
+  enabled: boolean;
+}
+
+export interface GasEstimate {
+  gasLimit: string;
+  gasPrice?: string;
+  maxFeePerGas?: string;
+  maxPriorityFeePerGas?: string;
+  estimatedCost: string;
+  estimatedCostUsd?: string;
 }

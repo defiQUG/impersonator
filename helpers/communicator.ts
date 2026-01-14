@@ -8,6 +8,7 @@ import {
   RequestId,
 } from "../types";
 import { getSDKVersion } from "./utils";
+import { SECURITY } from "../utils/constants";
 
 type MessageHandler = (
   msg: SDKMessageEvent
@@ -26,11 +27,35 @@ type SDKMethods = Methods | LegacyMethods;
 class AppCommunicator {
   private iframeRef: MutableRefObject<HTMLIFrameElement | null>;
   private handlers = new Map<SDKMethods, MessageHandler>();
+  private messageTimestamps = new Map<string, number>();
+  private allowedOrigins: string[] = [];
+  private cleanupInterval?: NodeJS.Timeout;
 
   constructor(iframeRef: MutableRefObject<HTMLIFrameElement | null>) {
     this.iframeRef = iframeRef;
 
     window.addEventListener("message", this.handleIncomingMessage);
+    
+    // Clean old timestamps periodically
+    this.cleanupInterval = setInterval(
+      () => this.cleanOldTimestamps(),
+      SECURITY.MESSAGE_TIMESTAMP_CLEANUP_INTERVAL_MS
+    );
+  }
+
+  private cleanOldTimestamps(): void {
+    const cutoffTime = Date.now() - SECURITY.MESSAGE_TIMESTAMP_RETENTION_MS;
+    for (const [id, timestamp] of this.messageTimestamps.entries()) {
+      if (timestamp < cutoffTime) {
+        this.messageTimestamps.delete(id);
+      }
+    }
+  }
+
+  setAllowedOrigin(origin: string): void {
+    if (origin && !this.allowedOrigins.includes(origin)) {
+      this.allowedOrigins.push(origin);
+    }
   }
 
   on = (method: SDKMethods, handler: MessageHandler): void => {
@@ -38,14 +63,53 @@ class AppCommunicator {
   };
 
   private isValidMessage = (msg: SDKMessageEvent): boolean => {
+    // Validate message structure
+    if (!msg.data || typeof msg.data !== 'object') {
+      return false;
+    }
+
+    // Check iframe source
+    const sentFromIframe = this.iframeRef.current?.contentWindow === msg.source;
+    if (!sentFromIframe) {
+      return false;
+    }
+
+    // Check for known method
+    const knownMethod = Object.values(Methods).includes(msg.data.method);
+    if (!knownMethod && !Object.values(LegacyMethods).includes(msg.data.method as unknown as LegacyMethods)) {
+      return false;
+    }
+
+    // Replay protection - check timestamp
+    const messageId = `${msg.data.id}_${msg.data.method}`;
+    const now = Date.now();
+    const lastTimestamp = this.messageTimestamps.get(messageId) || 0;
+    
+    // Reject messages within replay window (potential replay)
+    if (now - lastTimestamp < SECURITY.MESSAGE_REPLAY_WINDOW_MS) {
+      return false;
+    }
+    
+    this.messageTimestamps.set(messageId, now);
+
+    // Validate origin if allowed origins are set
+    if (this.allowedOrigins.length > 0 && msg.origin) {
+      try {
+        const messageOrigin = new URL(msg.origin).origin;
+        if (!this.allowedOrigins.includes(messageOrigin)) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+
+    // Special case for cookie check (legacy support)
     if (msg.data.hasOwnProperty("isCookieEnabled")) {
       return true;
     }
 
-    const sentFromIframe = this.iframeRef.current?.contentWindow === msg.source;
-    const knownMethod = Object.values(Methods).includes(msg.data.method);
-
-    return sentFromIframe && knownMethod;
+    return true;
   };
 
   private canHandleMessage = (msg: SDKMessageEvent): boolean => {
@@ -61,8 +125,18 @@ class AppCommunicator {
           sdkVersion
         )
       : MessageFormatter.makeResponse(requestId, data, sdkVersion);
-    // console.log("send", { msg });
-    this.iframeRef.current?.contentWindow?.postMessage(msg, "*");
+    
+    // Get target origin - use specific origin instead of wildcard
+    const getTargetOrigin = (): string => {
+      if (this.allowedOrigins.length > 0) {
+        return this.allowedOrigins[0];
+      }
+      // Fallback to current origin if no specific origin set
+      return typeof window !== "undefined" ? window.location.origin : "*";
+    };
+    
+    const targetOrigin = getTargetOrigin();
+    this.iframeRef.current?.contentWindow?.postMessage(msg, targetOrigin);
   };
 
   handleIncomingMessage = async (msg: SDKMessageEvent): Promise<void> => {
@@ -89,6 +163,10 @@ class AppCommunicator {
 
   clear = (): void => {
     window.removeEventListener("message", this.handleIncomingMessage);
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = undefined;
+    }
   };
 }
 

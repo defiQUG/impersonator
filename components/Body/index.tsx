@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Container, useToast, Center, Spacer, Flex } from "@chakra-ui/react";
+import { Container, useToast, Center, Spacer, Flex, VStack } from "@chakra-ui/react";
 
 import { SingleValue } from "chakra-react-select";
 // WC v2
@@ -13,6 +13,9 @@ import { ethers } from "ethers";
 import axios from "axios";
 import networksList from "evm-rpcs-list";
 import { useSafeInject } from "../../contexts/SafeInjectContext";
+import { useTransaction } from "../../contexts/TransactionContext";
+import { useSmartWallet } from "../../contexts/SmartWalletContext";
+import { TransactionExecutionMethod } from "../../types";
 import TenderlySettings from "./TenderlySettings";
 import AddressInput from "./AddressInput";
 import { SelectedNetworkOption, TxnDataType } from "../../types";
@@ -23,6 +26,12 @@ import IFrameConnectTab from "./IFrameConnectTab";
 import BrowserExtensionTab from "./BrowserExtensionTab";
 import TransactionRequests from "./TransactionRequests";
 import NotificationBar from "./NotificationBar";
+import WalletManager from "../SmartWallet/WalletManager";
+import OwnerManagement from "../SmartWallet/OwnerManagement";
+import WalletBalance from "../Balance/WalletBalance";
+import TransactionApproval from "../TransactionExecution/TransactionApproval";
+import TransactionBuilder from "../TransactionExecution/TransactionBuilder";
+import TransactionHistory from "../TransactionExecution/TransactionHistory";
 
 const WCMetadata = {
   name: "Impersonator",
@@ -32,7 +41,7 @@ const WCMetadata = {
 };
 
 const core = new Core({
-  projectId: process.env.NEXT_PUBLIC_WC_PROJECT_ID,
+  projectId: process.env.NEXT_PUBLIC_WC_PROJECT_ID || "demo-project-id",
 });
 
 const primaryNetworkIds = [
@@ -80,10 +89,11 @@ function Body() {
     urlFromURL = urlParams.get("url");
     chainFromURL = urlParams.get("chain");
   }
-  if (typeof localStorage !== "undefined") {
-    showAddressCache = localStorage.getItem("showAddress");
-    urlFromCache = localStorage.getItem("appUrl");
-    tenderlyForkIdCache = localStorage.getItem("tenderlyForkId");
+  // Use sessionStorage for UI preferences (non-sensitive)
+  if (typeof sessionStorage !== "undefined") {
+    showAddressCache = sessionStorage.getItem("showAddress") ?? null;
+    urlFromCache = sessionStorage.getItem("appUrl") ?? null;
+    tenderlyForkIdCache = sessionStorage.getItem("tenderlyForkId") ?? null;
   }
   let networkIdViaURL = 1;
   if (chainFromURL) {
@@ -108,6 +118,8 @@ function Body() {
     iframeRef,
     latestTransaction,
   } = useSafeInject();
+  const { createTransaction, defaultExecutionMethod } = useTransaction();
+  const { activeWallet } = useSmartWallet();
 
   const [provider, setProvider] = useState<ethers.providers.JsonRpcProvider>();
   const [showAddress, setShowAddress] = useState(
@@ -148,8 +160,10 @@ function Body() {
   useEffect(() => {
     // only use cached address if no address from url provided
     if (!addressFromURL) {
-      // getCachedSession
-      const _showAddress = localStorage.getItem("showAddress") ?? undefined;
+      // getCachedSession - use sessionStorage for UI preferences
+      const _showAddress = typeof sessionStorage !== "undefined" 
+        ? sessionStorage.getItem("showAddress") ?? undefined
+        : undefined;
       // WC V2
       initWeb3Wallet(true, _showAddress);
     }
@@ -174,16 +188,23 @@ function Body() {
   }, [provider]);
 
   useEffect(() => {
-    localStorage.setItem("tenderlyForkId", tenderlyForkId);
+    // Use sessionStorage for UI preferences (non-sensitive)
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem("tenderlyForkId", tenderlyForkId);
+    }
   }, [tenderlyForkId]);
 
   useEffect(() => {
-    localStorage.setItem("showAddress", showAddress);
+    // Use sessionStorage for UI preferences (non-sensitive)
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem("showAddress", showAddress);
+    }
   }, [showAddress]);
 
   useEffect(() => {
-    if (inputAppUrl) {
-      localStorage.setItem("appUrl", inputAppUrl);
+    // Use sessionStorage for UI preferences (non-sensitive)
+    if (inputAppUrl && typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem("appUrl", inputAppUrl);
     }
   }, [inputAppUrl]);
 
@@ -210,7 +231,7 @@ function Body() {
           return data;
         } else {
           return [
-            { ...newTxn, value: parseInt(newTxn.value, 16).toString() },
+            { ...newTxn, value: ethers.BigNumber.from("0x" + newTxn.value).toString() },
             ...data,
           ];
         }
@@ -268,8 +289,8 @@ function Body() {
         setShowAddress(
           _showAddress && _showAddress.length > 0 ? _showAddress : _address
         );
-        if (!(_showAddress && _showAddress.length > 0)) {
-          localStorage.setItem("showAddress", _address);
+        if (!(_showAddress && _showAddress.length > 0) && typeof sessionStorage !== "undefined") {
+          sessionStorage.setItem("showAddress", _address);
         }
         setAddress(_address);
         setUri(
@@ -386,7 +407,7 @@ function Body() {
   };
 
   const onSessionProposal = useCallback(
-    async (proposal) => {
+    async (proposal: { params: { requiredNamespaces: Record<string, ProposalTypes.BaseRequiredNamespace>; optionalNamespaces?: Record<string, any> }; id: number }) => {
       if (loading) {
         setLoading(false);
       }
@@ -447,15 +468,17 @@ function Body() {
 
   const handleSendTransaction = useCallback(
     async (id: number, params: any[], topic?: string) => {
+      const txValue = params[0].value
+        ? ethers.BigNumber.from(params[0].value).toString()
+        : "0";
+
       setSendTxnData((data) => {
         const newTxn = {
           id: id,
           from: params[0].from,
           to: params[0].to,
           data: params[0].data,
-          value: params[0].value
-            ? parseInt(params[0].value, 16).toString()
-            : "0",
+          value: txValue,
         };
 
         if (data.some((d) => d.id === newTxn.id)) {
@@ -465,7 +488,39 @@ function Body() {
         }
       });
 
-      if (tenderlyForkId.length > 0) {
+      // If active smart wallet exists, create transaction for approval/execution
+      if (activeWallet) {
+        try {
+          // Convert value properly using BigNumber
+          const valueBigNumber = ethers.BigNumber.from(txValue);
+          const valueHex = valueBigNumber.toHexString();
+
+          await createTransaction({
+            from: activeWallet.address,
+            to: params[0].to,
+            value: valueHex,
+            data: params[0].data || "0x",
+            method: defaultExecutionMethod,
+          });
+
+          toast({
+            title: "Transaction Created",
+            description: "Transaction added to approval queue",
+            status: "info",
+            isClosable: true,
+          });
+        } catch (error: any) {
+          toast({
+            title: "Transaction Creation Failed",
+            description: error.message || "Failed to create transaction",
+            status: "error",
+            isClosable: true,
+          });
+        }
+      }
+
+      // Handle execution method
+      if (defaultExecutionMethod === TransactionExecutionMethod.SIMULATION && tenderlyForkId.length > 0) {
         const { data: res } = await axios.post(
           "https://rpc.tenderly.co/fork/" + tenderlyForkId,
           {
@@ -477,30 +532,6 @@ function Body() {
         );
         console.log({ res });
 
-        // Approve Call Request
-        if (web3wallet && topic) {
-          // await web3wallet.respondSessionRequest({
-          //   topic,
-          //   response: {
-          //     jsonrpc: "2.0",
-          //     id: res.id,
-          //     result: res.result,
-          //   },
-          // });
-
-          await web3wallet.respondSessionRequest({
-            topic,
-            response: {
-              jsonrpc: "2.0",
-              id: id,
-              error: {
-                code: 0,
-                message: "Method not supported by Impersonator",
-              },
-            },
-          });
-        }
-
         toast({
           title: "Txn Simulated on Tenderly",
           description: `Hash: ${res.result}`,
@@ -509,8 +540,24 @@ function Body() {
           duration: null,
           isClosable: true,
         });
-      } else {
-        if (web3wallet && topic) {
+      }
+
+      // Respond to WalletConnect
+      if (web3wallet && topic) {
+        if (activeWallet && defaultExecutionMethod !== TransactionExecutionMethod.SIMULATION) {
+          // For now, return error - actual execution will be handled through approval flow
+          await web3wallet.respondSessionRequest({
+            topic,
+            response: {
+              jsonrpc: "2.0",
+              id: id,
+              error: {
+                code: 0,
+                message: "Transaction queued for approval. Check Smart Wallet tab.",
+              },
+            },
+          });
+        } else {
           await web3wallet.respondSessionRequest({
             topic,
             response: {
@@ -525,11 +572,11 @@ function Body() {
         }
       }
     },
-    [tenderlyForkId, web3wallet]
+    [tenderlyForkId, web3wallet, activeWallet, createTransaction, defaultExecutionMethod, toast]
   );
 
   const onSessionRequest = useCallback(
-    async (event) => {
+    async (event: { topic: string; params: { request: any }; id: number }) => {
       const { topic, params, id } = event;
       const { request } = params;
 
@@ -749,6 +796,21 @@ function Body() {
               );
             case 2:
               return <BrowserExtensionTab />;
+            case 3:
+              return (
+                <VStack spacing={6} mt={4} align="stretch">
+                  <WalletManager />
+                  {activeWallet && (
+                    <>
+                      <OwnerManagement />
+                      <WalletBalance />
+                      <TransactionBuilder />
+                      <TransactionApproval />
+                      <TransactionHistory />
+                    </>
+                  )}
+                </VStack>
+              );
           }
         })()}
         <Center>

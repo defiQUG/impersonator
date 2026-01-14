@@ -17,8 +17,11 @@ import { DeleteIcon } from "@chakra-ui/icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faSave } from "@fortawesome/free-solid-svg-icons";
 import { slicedText } from "../../TransactionRequests";
+import { SecureStorage } from "@/utils/encryption";
+import { validateAddress } from "@/utils/security";
+import { STORAGE_KEYS } from "@/utils/constants";
 
-const STORAGE_KEY = "address-book";
+const secureStorage = new SecureStorage();
 
 interface SavedAddressInfo {
   address: string;
@@ -45,7 +48,30 @@ function AddressBook({
   const [savedAddresses, setSavedAddresses] = useState<SavedAddressInfo[]>([]);
 
   useEffect(() => {
-    setSavedAddresses(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]"));
+    const loadAddresses = async () => {
+      try {
+        const stored = await secureStorage.getItem(STORAGE_KEYS.ADDRESS_BOOK);
+        if (stored) {
+          const parsed = JSON.parse(stored) as SavedAddressInfo[];
+          setSavedAddresses(parsed);
+        }
+      } catch (error) {
+        console.error("Failed to load address book:", error);
+        // Try to migrate from plain localStorage
+        try {
+          const legacy = localStorage.getItem("address-book");
+          if (legacy) {
+            const parsed = JSON.parse(legacy) as SavedAddressInfo[];
+            await secureStorage.setItem(STORAGE_KEYS.ADDRESS_BOOK, legacy);
+            localStorage.removeItem("address-book");
+            setSavedAddresses(parsed);
+          }
+        } catch (migrationError) {
+          console.error("Failed to migrate address book:", migrationError);
+        }
+      }
+    };
+    loadAddresses();
   }, []);
 
   useEffect(() => {
@@ -53,7 +79,21 @@ function AddressBook({
   }, [showAddress]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(savedAddresses));
+    const saveAddresses = async () => {
+      if (savedAddresses.length > 0) {
+        try {
+          await secureStorage.setItem(
+            STORAGE_KEYS.ADDRESS_BOOK,
+            JSON.stringify(savedAddresses)
+          );
+        } catch (error) {
+          console.error("Failed to save address book:", error);
+        }
+      } else {
+        secureStorage.removeItem(STORAGE_KEYS.ADDRESS_BOOK);
+      }
+    };
+    saveAddresses();
   }, [savedAddresses]);
 
   // reset label when modal is reopened
@@ -95,15 +135,34 @@ function AddressBook({
               isDisabled={
                 newAddressInput.length === 0 || newLableInput.length === 0
               }
-              onClick={() =>
+              onClick={async () => {
+                // Validate address
+                const validation = validateAddress(newAddressInput);
+                if (!validation.valid) {
+                  // Show error (would use toast in production)
+                  console.error("Invalid address:", validation.error);
+                  return;
+                }
+
+                const checksummedAddress = validation.checksummed!;
+                
+                // Check for duplicates
+                const isDuplicate = savedAddresses.some(
+                  (a) => a.address.toLowerCase() === checksummedAddress.toLowerCase()
+                );
+                if (isDuplicate) {
+                  console.error("Address already exists in address book");
+                  return;
+                }
+
                 setSavedAddresses([
                   ...savedAddresses,
                   {
-                    address: newAddressInput,
+                    address: checksummedAddress,
                     label: newLableInput,
                   },
-                ])
-              }
+                ]);
+              }}
             >
               <HStack>
                 <FontAwesomeIcon icon={faSave} />

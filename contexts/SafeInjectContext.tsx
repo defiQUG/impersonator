@@ -6,8 +6,11 @@ import React, {
   useRef,
   useCallback,
 } from "react";
-import { providers, utils } from "ethers";
+import { providers, utils, ethers } from "ethers";
 import { useAppCommunicator } from "../helpers/communicator";
+import { useSmartWallet } from "./SmartWalletContext";
+import { useTransaction } from "./TransactionContext";
+import { getWalletBalance } from "../helpers/balance";
 import {
   InterfaceMessageIds,
   InterfaceMessageProps,
@@ -64,6 +67,20 @@ export const SafeInjectProvider: React.FunctionComponent<FCProps> = ({
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const communicator = useAppCommunicator(iframeRef);
+  const { activeWallet, setProvider: setSmartWalletProvider } = useSmartWallet();
+  const { createTransaction } = useTransaction();
+
+  // Set allowed origin for iframe communication
+  useEffect(() => {
+    if (appUrl && communicator) {
+      try {
+        const url = new URL(appUrl);
+        communicator.setAllowedOrigin(url.origin);
+      } catch (e) {
+        console.error("Invalid app URL:", e);
+      }
+    }
+  }, [appUrl, communicator]);
 
   const sendMessageToIFrame = useCallback(
     function <T extends InterfaceMessageIds>(
@@ -89,19 +106,35 @@ export const SafeInjectProvider: React.FunctionComponent<FCProps> = ({
   useEffect(() => {
     if (!rpcUrl) return;
 
-    setProvider(new providers.StaticJsonRpcProvider(rpcUrl));
-  }, [rpcUrl]);
+    const newProvider = new providers.StaticJsonRpcProvider(rpcUrl);
+    setProvider(newProvider);
+    setSmartWalletProvider(newProvider);
+  }, [rpcUrl, setSmartWalletProvider]);
 
   useEffect(() => {
     if (!provider) return;
 
-    communicator?.on(Methods.getSafeInfo, async () => ({
-      safeAddress: address,
-      chainId: (await provider.getNetwork()).chainId,
-      owners: [],
-      threshold: 1,
-      isReadOnly: false,
-    }));
+    communicator?.on(Methods.getSafeInfo, async () => {
+      // Use active smart wallet if available, otherwise fall back to impersonated address
+      if (activeWallet && provider) {
+        const network = await provider.getNetwork();
+        const balance = await provider.getBalance(activeWallet.address);
+        return {
+          safeAddress: activeWallet.address,
+          network: network.name as any,
+          ethBalance: balance.toString(),
+        };
+      }
+      
+      // Fallback to impersonated address
+      const network = await provider.getNetwork();
+      const balance = address ? await provider.getBalance(address) : ethers.BigNumber.from(0);
+      return {
+        safeAddress: address || "0x0000000000000000000000000000000000000000",
+        network: network.name as any,
+        ethBalance: balance.toString(),
+      };
+    });
 
     communicator?.on(Methods.getEnvironmentInfo, async () => ({
       origin: document.location.origin,
@@ -121,7 +154,7 @@ export const SafeInjectProvider: React.FunctionComponent<FCProps> = ({
       }
     });
 
-    communicator?.on(Methods.sendTransactions, (msg) => {
+    communicator?.on(Methods.sendTransactions, async (msg) => {
       // @ts-expect-error explore ways to fix this
       const transactions = (msg.data.params.txs as Transaction[]).map(
         ({ to, ...rest }) => ({
@@ -129,11 +162,41 @@ export const SafeInjectProvider: React.FunctionComponent<FCProps> = ({
           ...rest,
         })
       );
+      
+      const tx = transactions[0];
       setLatestTransaction({
         id: parseInt(msg.data.id.toString()),
-        ...transactions[0],
+        ...tx,
       });
-      // openConfirmationModal(transactions, msg.data.params.params, msg.data.id)
+
+      // Create transaction in transaction context for approval/execution
+      if (activeWallet) {
+        try {
+          // Validate transaction data
+          const { validateTransactionRequest } = await import("../utils/security");
+          const validation = validateTransactionRequest({
+            from: activeWallet.address,
+            to: tx.to,
+            value: tx.value || "0",
+            data: tx.data || "0x",
+          });
+
+          if (!validation.valid) {
+            console.error("Invalid transaction from iframe:", validation.errors);
+            return;
+          }
+
+          await createTransaction({
+            from: activeWallet.address,
+            to: tx.to,
+            value: tx.value || "0",
+            data: tx.data || "0x",
+            method: "DIRECT_ONCHAIN" as any,
+          });
+        } catch (error: any) {
+          console.error("Failed to create transaction from iframe:", error);
+        }
+      }
     });
 
     communicator?.on(Methods.signMessage, async (msg) => {
@@ -147,7 +210,59 @@ export const SafeInjectProvider: React.FunctionComponent<FCProps> = ({
 
       // openSignMessageModal(typedData, msg.data.id, Methods.signTypedMessage)
     });
-  }, [communicator, address, provider]);
+
+    communicator?.on(Methods.getSafeBalances, async () => {
+      if (!activeWallet || !provider) {
+        return [];
+      }
+
+      try {
+        const network = await provider.getNetwork();
+        const balance = await getWalletBalance(
+          activeWallet.address,
+          network.chainId,
+          provider
+        );
+
+        return [
+          {
+            fiatTotal: "0",
+            items: [
+              {
+                tokenInfo: {
+                  type: "NATIVE_TOKEN" as any,
+                  address: "0x0000000000000000000000000000000000000000",
+                  decimals: 18,
+                  symbol: "ETH",
+                  name: "Ether",
+                  logoUri: "",
+                },
+                balance: balance.native,
+                fiatBalance: "0",
+                fiatConversion: "0",
+              },
+              ...balance.tokens.map((token) => ({
+                tokenInfo: {
+                  type: "ERC20" as any,
+                  address: token.tokenAddress,
+                  decimals: token.decimals,
+                  symbol: token.symbol,
+                  name: token.name,
+                  logoUri: token.logoUri || "",
+                },
+                balance: token.balance,
+                fiatBalance: "0",
+                fiatConversion: "0",
+              })),
+            ],
+          },
+        ];
+      } catch (error) {
+        console.error("Failed to get Safe balances", error);
+        return [];
+      }
+    });
+  }, [communicator, address, provider, activeWallet, createTransaction]);
 
   return (
     <SafeInjectContext.Provider
